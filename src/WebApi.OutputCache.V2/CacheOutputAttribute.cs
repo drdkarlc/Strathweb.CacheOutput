@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
@@ -12,6 +13,7 @@ using System.Threading.Tasks;
 using System.Web.Http;
 using System.Web.Http.Controllers;
 using System.Web.Http.Filters;
+using Newtonsoft.Json;
 using WebApi.OutputCache.Core;
 using WebApi.OutputCache.Core.Cache;
 using WebApi.OutputCache.Core.Time;
@@ -49,7 +51,17 @@ namespace WebApi.OutputCache.V2
         /// </summary>
         public int ClientTimeSpan { get; set; }
 
-        
+        /// <summary>
+        /// Comma-separated list of headers to preserve from cached response.
+        /// NOTE: Does not remove the following headers: etag.
+        /// </summary>
+        public string PreservedResponseHeaders { get; set; }
+
+        /// <summary>
+        /// Comma-separated list of headers to preserve from cached response content.
+        /// </summary>
+        public string PreservedContentHeaders { get; set; }
+
         private int? _sharedTimeSpan = null;
 
         /// <summary>
@@ -182,6 +194,8 @@ namespace WebApi.OutputCache.V2
             var responseMediaType = GetExpectedMediaType(config, actionContext);
             actionContext.Request.Properties[CurrentRequestMediaType] = responseMediaType;
             var cachekey = cacheKeyGenerator.MakeCacheKey(actionContext, responseMediaType, ExcludeQueryStringFromCacheKey);
+            var customResponseHeaders = _webApiCache.Get(cachekey + Constants.ResponseHeaders) as string;
+            var customContentHeaders = _webApiCache.Get(cachekey + Constants.ContentHeaders) as string;
 
             if (!_webApiCache.Contains(cachekey)) return;
 
@@ -195,6 +209,10 @@ namespace WebApi.OutputCache.V2
                         var time = CacheTimeQuery.Execute(DateTime.Now);
                         var quickResponse = actionContext.Request.CreateResponse(HttpStatusCode.NotModified);
                         ApplyCacheHeaders(quickResponse, time);
+
+                        AddCustomResponseHeaders(quickResponse, customResponseHeaders);
+                        AddCustomContentHeaders(quickResponse, customContentHeaders);
+                        
                         actionContext.Response = quickResponse;
                         return;
                     }
@@ -216,6 +234,8 @@ namespace WebApi.OutputCache.V2
 
             var cacheTime = CacheTimeQuery.Execute(DateTime.Now);
             ApplyCacheHeaders(actionContext.Response, cacheTime, contentGenerationTimestamp);
+            AddCustomResponseHeaders(actionContext.Response, customResponseHeaders);
+            AddCustomContentHeaders(actionContext.Response, customContentHeaders);
         }
 
         public override async Task OnActionExecutedAsync(HttpActionExecutedContext actionExecutedContext, CancellationToken cancellationToken)
@@ -226,6 +246,9 @@ namespace WebApi.OutputCache.V2
 
             var actionExecutionTimestamp = DateTimeOffset.Now;
             var cacheTime = CacheTimeQuery.Execute(actionExecutionTimestamp.DateTime);
+            var preservedResponseHeadersSerialized = string.IsNullOrWhiteSpace(PreservedResponseHeaders) ? null : JsonConvert.SerializeObject(actionExecutedContext.Response.Headers.Where(h => h.Key != null && PreservedResponseHeaders.Contains(h.Key)));
+            var preservedContentHeadersSerialized = string.IsNullOrWhiteSpace(PreservedContentHeaders) ? null : JsonConvert.SerializeObject(actionExecutedContext.Response.Content.Headers.Where(h => h.Key != null && PreservedContentHeaders.Contains(h.Key)));
+            
             if (cacheTime.AbsoluteExpiration > actionExecutionTimestamp)
             {
                 var httpConfig = actionExecutedContext.Request.GetConfiguration();
@@ -268,6 +291,20 @@ namespace WebApi.OutputCache.V2
                         _webApiCache.Add(cachekey + Constants.GenerationTimestampKey,
                                         actionExecutionTimestamp.ToString(),
                                         cacheTime.AbsoluteExpiration, baseKey);
+                        
+                        if (!string.IsNullOrWhiteSpace(preservedResponseHeadersSerialized))
+                        {
+                            _webApiCache.Add(cachekey + Constants.ResponseHeaders,
+                                preservedResponseHeadersSerialized,
+                                cacheTime.AbsoluteExpiration, baseKey);
+                        }
+
+                        if (!string.IsNullOrWhiteSpace(preservedContentHeadersSerialized))
+                        {
+                            _webApiCache.Add(cachekey + Constants.ContentHeaders,
+                                preservedContentHeadersSerialized,
+                                cacheTime.AbsoluteExpiration, baseKey);
+                        }
                     }
                 }
             }
@@ -275,9 +312,37 @@ namespace WebApi.OutputCache.V2
             ApplyCacheHeaders(actionExecutedContext.ActionContext.Response, cacheTime, actionExecutionTimestamp);
         }
 
+        protected virtual void AddCustomResponseHeaders(HttpResponseMessage response, string customResponseHeaders)
+        {
+            if (response == null) return;
+            AddCustomHeaders(response.Headers, customResponseHeaders);
+        }
+
+        private void AddCustomContentHeaders(HttpResponseMessage response, string customContentHeaders)
+        {
+            if (response?.Content == null) return;
+            AddCustomHeaders(response.Content.Headers, customContentHeaders);
+        }
+
+        private void AddCustomHeaders(HttpHeaders headerCollection, string customHeaders)
+        {
+            if (string.IsNullOrWhiteSpace(customHeaders) || headerCollection == null) return;
+            var headersDeserialized = JsonConvert.DeserializeObject<IEnumerable<KeyValuePair<string, IEnumerable<string>>>>(customHeaders);
+
+            foreach (var header in headersDeserialized?.Where(h => !string.IsNullOrEmpty(h.Key) && h.Value != null) ?? new KeyValuePair<string, IEnumerable<string>>[0])
+            {
+                headerCollection.Remove(header.Key); // Returns if header does not exist.
+                foreach (var value in header.Value ?? new string[0])
+                {
+                    headerCollection.Add(header.Key, value);
+                }
+            }
+        }
+        
         protected virtual void ApplyCacheHeaders(HttpResponseMessage response, CacheTime cacheTime, DateTimeOffset? contentGenerationTimestamp = null)
         {
-            if (cacheTime.ClientTimeSpan > TimeSpan.Zero || MustRevalidate || Private)
+            var allCustomHeaders = $"{PreservedResponseHeaders},{PreservedContentHeaders}";
+            if (!allCustomHeaders.Contains("Cache-Control") && (cacheTime.ClientTimeSpan > TimeSpan.Zero || MustRevalidate || Private))
             {
                 var cachecontrol = new CacheControlHeaderValue
                                        {
@@ -289,12 +354,14 @@ namespace WebApi.OutputCache.V2
 
                 response.Headers.CacheControl = cachecontrol;
             }
-            else if (NoCache)
+            else if (!allCustomHeaders.Contains("Cache-Control") && NoCache)
             {
                 response.Headers.CacheControl = new CacheControlHeaderValue { NoCache = true };
+
+                if(!allCustomHeaders.Contains("Pragma"))
                 response.Headers.Add("Pragma", "no-cache");
             }
-            if ((response.Content != null) && contentGenerationTimestamp.HasValue)
+            if (!allCustomHeaders.Contains("Last-Modified") && response.Content != null && contentGenerationTimestamp.HasValue)
             {
                 response.Content.Headers.LastModified = contentGenerationTimestamp.Value;
             }

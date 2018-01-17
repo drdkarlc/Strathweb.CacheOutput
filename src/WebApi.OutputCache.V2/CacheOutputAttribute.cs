@@ -53,7 +53,6 @@ namespace WebApi.OutputCache.V2
 
         /// <summary>
         /// Comma-separated list of headers to preserve from cached response.
-        /// NOTE: Does not remove the following headers: etag.
         /// </summary>
         public string PreservedResponseHeaders { get; set; }
 
@@ -194,11 +193,11 @@ namespace WebApi.OutputCache.V2
             var responseMediaType = GetExpectedMediaType(config, actionContext);
             actionContext.Request.Properties[CurrentRequestMediaType] = responseMediaType;
             var cachekey = cacheKeyGenerator.MakeCacheKey(actionContext, responseMediaType, ExcludeQueryStringFromCacheKey);
-            var customResponseHeaders = _webApiCache.Get(cachekey + Constants.ResponseHeaders) as string;
-            var customContentHeaders = _webApiCache.Get(cachekey + Constants.ContentHeaders) as string;
-
             if (!_webApiCache.Contains(cachekey)) return;
 
+            var customResponseHeaders = _webApiCache.Get(cachekey + Constants.ResponseHeaders) as string;
+            var customContentHeaders = _webApiCache.Get(cachekey + Constants.ContentHeaders) as string;
+            
             if (actionContext.Request.Headers.IfNoneMatch != null)
             {
                 var etag = _webApiCache.Get<string>(cachekey + Constants.EtagKey);
@@ -260,8 +259,11 @@ namespace WebApi.OutputCache.V2
 
                 if (!string.IsNullOrWhiteSpace(cachekey) && !(_webApiCache.Contains(cachekey)))
                 {
-                    SetEtag(actionExecutedContext.Response, CreateEtag(actionExecutedContext, cachekey, cacheTime));
-
+                    if (!PreservedResponseHeaders.ToLower().Contains("etag"))
+                    {
+                        SetEtag(actionExecutedContext.Response, CreateEtag(actionExecutedContext, cachekey, cacheTime));
+                    }
+                    
                     var responseContent = actionExecutedContext.Response.Content;
 
                     if (responseContent != null)
@@ -341,8 +343,8 @@ namespace WebApi.OutputCache.V2
         
         protected virtual void ApplyCacheHeaders(HttpResponseMessage response, CacheTime cacheTime, DateTimeOffset? contentGenerationTimestamp = null)
         {
-            var allCustomHeaders = $"{PreservedResponseHeaders},{PreservedContentHeaders}";
-            if (!allCustomHeaders.Contains("Cache-Control") && (cacheTime.ClientTimeSpan > TimeSpan.Zero || MustRevalidate || Private))
+            var allCustomHeaders = $"{PreservedResponseHeaders},{PreservedContentHeaders}".ToLower();
+            if (!allCustomHeaders.Contains("cache-control") && (cacheTime.ClientTimeSpan > TimeSpan.Zero || MustRevalidate || Private))
             {
                 var cachecontrol = new CacheControlHeaderValue
                                        {
@@ -354,11 +356,11 @@ namespace WebApi.OutputCache.V2
 
                 response.Headers.CacheControl = cachecontrol;
             }
-            else if (!allCustomHeaders.Contains("Cache-Control") && NoCache)
+            else if (!allCustomHeaders.Contains("cache-control") && NoCache)
             {
                 response.Headers.CacheControl = new CacheControlHeaderValue { NoCache = true };
             }
-            if (!allCustomHeaders.Contains("Last-Modified") && response.Content != null && contentGenerationTimestamp.HasValue)
+            if (!allCustomHeaders.Contains("last-modified") && response.Content != null && contentGenerationTimestamp.HasValue)
             {
                 response.Content.Headers.LastModified = contentGenerationTimestamp.Value;
             }

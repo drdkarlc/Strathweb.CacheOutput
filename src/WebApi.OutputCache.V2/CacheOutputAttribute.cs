@@ -357,9 +357,6 @@ namespace WebApi.OutputCache.V2
             else if (!allCustomHeaders.Contains("Cache-Control") && NoCache)
             {
                 response.Headers.CacheControl = new CacheControlHeaderValue { NoCache = true };
-
-                if(!allCustomHeaders.Contains("Pragma"))
-                response.Headers.Add("Pragma", "no-cache");
             }
             if (!allCustomHeaders.Contains("Last-Modified") && response.Content != null && contentGenerationTimestamp.HasValue)
             {
